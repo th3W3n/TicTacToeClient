@@ -1,9 +1,18 @@
 using UnityEngine;
-// using UnityEngine.Assertions;
 using Unity.Collections;
 using Unity.Networking.Transport;
-using System.Text;
+using Unity.Networking.Transport.Error; //for DisconnectReason
+using System.Text; //for encoding
 
+public enum TransportPipeline
+{
+    NotIdentified,
+    ReliableAndInOrder,
+    FireAndForget
+}
+
+//networking only: owns the socket and the connection to the server
+//forwards everything else to NetworkClientProcessing
 public class NetworkClient : MonoBehaviour
 {
     private NetworkDriver networkDriver;
@@ -20,32 +29,32 @@ public class NetworkClient : MonoBehaviour
 
     void Start()
     {
-        networkDriver = NetworkDriver.Create();
-        reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
-        nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
-        if (!NetworkEndpoint.TryParse(IPAddress, NetworkPort, out var endpoint, NetworkFamily.Ipv4))
+        //singleton: only one client may exist
+        if (NetworkClientProcessing.GetNetworkedClient() != null)
         {
-            Debug.Log("Invalid server IP: " + IPAddress);
+            Debug.LogError("Another NetworkClient existed already");
+            Destroy(gameObject);
             return;
         }
-        networkConnection = networkDriver.Connect(endpoint);
+        NetworkClientProcessing.SetNetworkedClient(this);
+        DontDestroyOnLoad(gameObject);
+
+        Connect();
     }
 
-    public void OnDestroy()
+    void OnDestroy()
     {
-        if (networkConnection.IsCreated) networkConnection.Disconnect(networkDriver);
-        networkConnection = default;
+        //only the real client clears the registration
+        if (NetworkClientProcessing.GetNetworkedClient() == this)
+            NetworkClientProcessing.SetNetworkedClient(null);
+
+        Disconnect();
         if (networkDriver.IsCreated) networkDriver.Dispose();
     }
 
     void Update()
     {
-        #region Check Input and Send Msg
-
-        if (Input.GetKeyDown(KeyCode.A))
-            SendMessageToServer("Hello server's world, sincerely your network client");
-
-        #endregion
+        if (!networkDriver.IsCreated) return;
 
         networkDriver.ScheduleUpdate().Complete();
 
@@ -67,15 +76,16 @@ public class NetworkClient : MonoBehaviour
 
         while (PopNetworkEventAndCheckForData(out var networkEventType, out var streamReader, out var pipelineUsedToSendEvent))
         {
+            TransportPipeline pipelineUsed = TransportPipeline.NotIdentified;
             if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
-                Debug.Log("Network event from: reliableAndInOrderPipeline");
+                pipelineUsed = TransportPipeline.ReliableAndInOrder;
             else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
-                Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
+                pipelineUsed = TransportPipeline.FireAndForget;
 
             switch (networkEventType)
             {
                 case NetworkEvent.Type.Connect:
-                    Debug.Log("We are now connected to the server");
+                    NetworkClientProcessing.ConnectionEvent();
                     break;
                 case NetworkEvent.Type.Data:
                     int sizeOfDataBuffer = streamReader.ReadInt();
@@ -87,11 +97,13 @@ public class NetworkClient : MonoBehaviour
                     byte[] byteBuffer = new byte[sizeOfDataBuffer];
                     streamReader.ReadBytes(byteBuffer);
                     string msg = Encoding.Unicode.GetString(byteBuffer);
-                    ProcessReceivedMsg(msg);
+                    NetworkClientProcessing.ReceivedMessageFromServer(msg, pipelineUsed);
                     break;
                 case NetworkEvent.Type.Disconnect:
-                    Debug.Log("Client has disconnected from server:" + (Unity.Networking.Transport.Error.DisconnectReason)streamReader.ReadByte());
+                    DisconnectReason reason = (DisconnectReason)streamReader.ReadByte();
+                    Debug.Log("Disconnected from server: " + reason);
                     networkConnection = default;
+                    NetworkClientProcessing.DisconnectionEvent();
                     break;
             }
         }
@@ -108,18 +120,22 @@ public class NetworkClient : MonoBehaviour
         return true;
     }
 
-    private void ProcessReceivedMsg(string msg)
+    public void SendMessageToServer(string msg, TransportPipeline pipeline)
     {
-        Debug.Log("Msg received = " + msg);
-    }
+        if (!IsConnected())
+        {
+            Debug.LogWarning("SendMessageToServer: not connected to server");
+            return;
+        }
 
-    public void SendMessageToServer(string msg)
-    {
-        if (!networkConnection.IsCreated) return;
-        int status = networkDriver.BeginSend(reliableAndInOrderPipeline, networkConnection, out var streamWriter);
+        NetworkPipeline networkPipeline = pipeline == TransportPipeline.FireAndForget
+            ? nonReliableNotInOrderedPipeline
+            : reliableAndInOrderPipeline;
+
+        int status = networkDriver.BeginSend(networkPipeline, networkConnection, out var streamWriter);
         if (status != 0)
         {
-            Debug.Log("BeginSend failed: " + status);
+            Debug.LogWarning("BeginSend failed: " + status);
             return;
         }
 
@@ -131,4 +147,46 @@ public class NetworkClient : MonoBehaviour
             Debug.LogWarning("EndSend failed: " + sent);
     }
 
+    public void Connect()
+    {
+        if (networkConnection.IsCreated)
+        {
+            Debug.LogWarning("Connect: already connected or connecting");
+            return;
+        }
+
+        //create the driver only once;
+        //calling Connect() again reuses it instead of leaking a new one
+        if (!networkDriver.IsCreated)
+        {
+            networkDriver = NetworkDriver.Create();
+            reliableAndInOrderPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage), typeof(ReliableSequencedPipelineStage));
+            nonReliableNotInOrderedPipeline = networkDriver.CreatePipeline(typeof(FragmentationPipelineStage));
+        }
+
+        if (!NetworkEndpoint.TryParse(IPAddress, NetworkPort, out var endpoint, NetworkFamily.Ipv4))
+        {
+            Debug.LogError("Invalid server IP: " + IPAddress);
+            return;
+        }
+        networkConnection = networkDriver.Connect(endpoint);
+        reportedNoConnection = false;
+    }
+
+    public void Disconnect()
+    {
+        if (!networkConnection.IsCreated) return;
+
+        networkConnection.Disconnect(networkDriver);
+        //send the disconnect packet now
+        //so the server sees ClosedByRemote instead of a Timeout later
+        networkDriver.ScheduleFlushSend().Complete();
+        networkConnection = default;
+    }
+
+    public bool IsConnected()
+    {
+        return networkConnection.IsCreated
+            && networkConnection.GetState(networkDriver) == NetworkConnection.State.Connected;
+    }
 }
